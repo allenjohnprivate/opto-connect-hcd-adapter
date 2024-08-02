@@ -1,0 +1,99 @@
+image: maven:3.9.6-sapmachine-17
+clone:
+  # sonar scanner needs the full history to assign issues properly
+  depth: full
+definitions:
+  services:
+    mongo:
+      image: mongo
+  steps:
+    - step: &buildAndTag
+        name: Build and Tag
+        services:
+          - mongo
+          - docker
+        caches:
+          - maven
+        script:
+          
+          # Disable Ryuk for TestContainers
+          - export TESTCONTAINERS_RYUK_DISABLED=true
+          
+          # chmod for mvnw
+          - chmod +x mvnw
+          
+          # Build and bump version
+          - bash ./mvnw -s settings.xml build-helper:parse-version versions:set -DnewVersion=\${parsedVersion.majorVersion}.\${parsedVersion.minorVersion}.\${parsedVersion.incrementalVersion}
+          
+          # Build version for Git tag
+          - MVN_VERSION=$(./mvnw -q -Dexec.executable=echo -Dexec.args='${project.version}' --non-recursive exec:exec)
+          
+          # publish to artifactory
+          - bash ./mvnw -s settings.xml deploy
+          
+          # Bump to next as SNAPSHOT
+          - bash ./mvnw -s settings.xml  build-helper:parse-version versions:set -DnewVersion=\${parsedVersion.majorVersion}.\${parsedVersion.minorVersion}.\${parsedVersion.nextIncrementalVersion}-SNAPSHOT
+          
+          # Generate change log
+          - bash ./mvnw se.bjurr.gitchangelog:git-changelog-maven-plugin:git-changelog
+          
+          # Git parameters
+          - export commit_message=$(git show -s --format=%B $BITBUCKET_COMMIT)
+          - export TICKET_NUMBER=$(echo "$commit_message" | grep -o -E '[A-Z]+-[0-9]+' | sed -n '1p')
+          
+          # Git Update
+          - apt-get update && apt-get install -y curl jq
+          - >
+            export access_token=$(curl -s -X POST -u "${CLIENT_ID}:${CLIENT_SECRET}" \
+              https://bitbucket.org/site/oauth2/access_token \
+              -d grant_type=client_credentials -d scopes="repository"| jq --raw-output '.access_token')
+          - git remote set-url origin "https://x-token-auth:${access_token}@bitbucket.org/${BITBUCKET_REPO_OWNER}/${BITBUCKET_REPO_SLUG}"
+          - git add .
+          - git commit -m "${TICKET_NUMBER} - [skip ci] build update ${MVN_VERSION}"
+          - git push
+          - git tag $MVN_VERSION
+          - git push origin --tags
+          
+          # Now merge master back to develop
+          - git fetch origin "+refs/heads/*:refs/remotes/origin/*"
+          - git checkout -b develop origin/develop
+          - git merge master
+          - git push origin develop
+          
+          
+pipelines:
+  pull-requests:
+    '**':
+      - step:
+          name: Build
+          services:
+            - mongo
+            - docker
+          caches:
+            - maven
+          script:
+            # Disable Ryuk for TestContainers
+            - export TESTCONTAINERS_RYUK_DISABLED=true
+            # chmod for mvnw
+            - chmod +x mvnw
+            - bash ./mvnw -s settings.xml verify
+  branches:
+    master:
+      - step: *buildAndTag
+    release/*:
+      - step: *buildAndTag
+  custom:
+    release:
+      - step:
+          name: Build and Tag
+          services:
+            - mongo
+            - docker
+          caches:
+            - maven
+          script:
+            # Disable Ryuk for TestContainers
+            - export TESTCONTAINERS_RYUK_DISABLED=true
+            # chmod for mvnw
+            - chmod +x mvnw
+            - bash ./mvnw -s settings.xml verify
